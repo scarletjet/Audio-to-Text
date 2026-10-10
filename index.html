@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="description" content="Record voice notes, turn speech into text, and sort what you said by the kind of thought it is.">
+<meta name="theme-color" content="#f2f4f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0f141b" media="(prefers-color-scheme: dark)">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon.svg">
+</head>
+<body>
+<!-- build:page-start -->
+<title>Thought Sorter</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="src/styles.css">
+
+<a class="skip" href="#board">Skip to your thoughts</a>
+
+<header class="topbar">
+  <div class="brand">
+    <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="12" width="3" height="8" rx="1.5"/><rect x="9" y="7" width="3" height="18" rx="1.5"/><rect x="15" y="10" width="3" height="12" rx="1.5"/><circle cx="25" cy="9" r="3"/><circle cx="25" cy="18" r="3" opacity=".7"/><circle cx="25" cy="27" r="3" opacity=".45"/></svg>
+    <h1>Thought Sorter</h1>
+  </div>
+  <button class="engine-pill" id="enginePill" type="button" aria-haspopup="dialog" title="How notes get sorted">
+    <span class="engine-dot" aria-hidden="true"></span><span id="engineLabel">On device</span>
+  </button>
+  <button class="icon-btn" id="settingsBtn" type="button" aria-label="Settings" aria-haspopup="dialog">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M19.4 13.5a7.6 7.6 0 0 0 0-3l2-1.6-2-3.4-2.4 1a7.5 7.5 0 0 0-2.6-1.5L14 2.5h-4l-.4 2.5A7.5 7.5 0 0 0 7 6.5l-2.4-1-2 3.4 2 1.6a7.6 7.6 0 0 0 0 3l-2 1.6 2 3.4 2.4-1a7.5 7.5 0 0 0 2.6 1.5l.4 2.5h4l.4-2.5a7.5 7.5 0 0 0 2.6-1.5l2.4 1 2-3.4-2-1.6Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+  </button>
+</header>
+
+<main class="wrap">
+  <section class="capture" id="capture" aria-label="New voice note">
+    <div class="capture-record" id="recordArea">
+      <button class="rec-btn" id="recBtn" type="button" aria-label="Start recording">
+        <span class="rec-ring" aria-hidden="true"></span>
+        <svg class="rec-icon rec-icon-mic" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        <svg class="rec-icon rec-icon-stop" viewBox="0 0 24 24" aria-hidden="true"><rect x="6.5" y="6.5" width="11" height="11" rx="2.5"/></svg>
+      </button>
+      <div class="rec-side">
+        <p class="rec-title" id="recTitle">Tap to record a voice note</p>
+        <p class="rec-sub" id="recSub">Talk freely. Your words appear as you speak, then get sorted into thoughts.</p>
+        <div class="rec-meter" id="recMeter" hidden>
+          <span class="rec-time" id="recTime">0:00</span>
+          <canvas id="wave" width="480" height="56" aria-hidden="true"></canvas>
+          <button class="btn btn-quiet" id="recCancel" type="button">Discard</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="live" id="live" hidden aria-live="polite">
+      <p class="live-text"><span id="liveFinal"></span><span class="live-interim" id="liveInterim"></span></p>
+    </div>
+
+    <div class="dictate" id="dictateArea">
+      <label class="dictate-label" for="draft" id="draftLabel">Or type, paste, or dictate a note</label>
+      <p class="dictate-hint" id="dictateHint" hidden>Tap the box, then tap the microphone on your keyboard and talk.</p>
+      <textarea id="draft" rows="3" placeholder="I need to call the dentist tomorrow. What if we turned the garage into a studio?"></textarea>
+      <div class="capture-actions">
+        <button class="btn btn-primary" id="sortBtn" type="button" disabled>Sort my thoughts</button>
+        <label class="btn btn-ghost file-btn" id="importLabel" for="fileInput">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15V4m0 0-4 4m4-4 4 4M5 15v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span id="importText">Import voice memos</span>
+        </label>
+        <input type="file" id="fileInput" multiple accept="audio/*,video/mp4,video/webm,.m4a,.mp3,.wav,.ogg,.oga,.opus,.webm,.aac,.flac,.amr,.3gp,.txt,.md,.vtt,.srt">
+      </div>
+    </div>
+
+    <div class="jobs" id="jobs" aria-live="polite"></div>
+  </section>
+
+  <nav class="tabs" role="tablist" aria-label="Views">
+    <button class="tab" role="tab" id="tab-thoughts" aria-controls="board" aria-selected="true" type="button">Thoughts</button>
+    <button class="tab" role="tab" id="tab-notes" aria-controls="notesView" aria-selected="false" type="button">Notes <span class="tab-count" id="notesCount">0</span></button>
+    <button class="tab" role="tab" id="tab-patterns" aria-controls="patternsView" aria-selected="false" type="button">Patterns</button>
+  </nav>
+
+  <div class="example-banner" id="exampleBanner" hidden>
+    <strong>Example notes.</strong> This is what sorting looks like. Record or type your first note and these go away.
+  </div>
+
+  <section id="board" class="view" role="tabpanel" aria-labelledby="tab-thoughts">
+    <div class="kind-grid" id="kindGrid" role="group" aria-label="Filter by kind of thought"></div>
+    <div class="filters">
+      <div class="search">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m16 16 4.5 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        <input id="search" type="search" placeholder="Search your thoughts" aria-label="Search your thoughts" autocomplete="off">
+      </div>
+      <div class="topic-row" id="topicRow" role="group" aria-label="Filter by topic"></div>
+    </div>
+    <div id="thoughtList" class="thought-list"></div>
+  </section>
+
+  <section id="notesView" class="view" role="tabpanel" aria-labelledby="tab-notes" hidden>
+    <div id="noteList" class="note-list"></div>
+  </section>
+
+  <section id="patternsView" class="view" role="tabpanel" aria-labelledby="tab-patterns" hidden>
+    <div class="range" role="group" aria-label="Time range">
+      <button class="chip" type="button" data-days="7" aria-pressed="true">7 days</button>
+      <button class="chip" type="button" data-days="30" aria-pressed="false">30 days</button>
+      <button class="chip" type="button" data-days="365" aria-pressed="false">All time</button>
+    </div>
+    <div id="patterns"></div>
+  </section>
+</main>
+
+<dialog id="settings" class="sheet" aria-labelledby="settingsTitle">
+  <form method="dialog" class="sheet-inner" id="settingsForm">
+    <div class="sheet-head">
+      <h2 id="settingsTitle">Settings</h2>
+      <button class="icon-btn" value="close" aria-label="Close settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+
+    <fieldset class="group" id="sortGroup">
+      <legend>Sorting</legend>
+      <label class="row-toggle" id="useClaudeRow">
+        <span><strong>Sort with Claude</strong><small id="claudeHelp">Claude splits and labels your notes with more nuance. On-device sorting is used when Claude is off or unavailable.</small></span>
+        <input type="checkbox" id="useClaude">
+      </label>
+      <div class="field" id="apiKeyField">
+        <label for="apiKey">Anthropic API key</label>
+        <input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-...">
+        <small>Stored only in this browser. Notes go straight from your device to Anthropic.</small>
+      </div>
+      <div class="field" id="modelField">
+        <label for="claudeModel">Claude model</label>
+        <select id="claudeModel">
+          <option value="claude-opus-5-5">Claude Opus 5.5 (best)</option>
+          <option value="claude-sonnet-5-5">Claude Sonnet 5.5 (balanced)</option>
+          <option value="claude-haiku-5-5">Claude Haiku 5.5 (fastest)</option>
+        </select>
+      </div>
+      <label class="row-toggle">
+        <span><strong>Tidy filler words</strong><small>Removes "um", "uh" and repeated words from transcripts.</small></span>
+        <input type="checkbox" id="tidy" checked>
+      </label>
+    </fieldset>
+
+    <fieldset class="group" id="speechGroup">
+      <legend>Speech to text</legend>
+      <div class="field">
+        <label for="speechMode">While recording</label>
+        <select id="speechMode">
+          <option value="live">Live transcript (browser speech)</option>
+          <option value="whisper">Private transcript after you stop (on-device Whisper)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="whisperModel">Whisper model for imports</label>
+        <select id="whisperModel">
+          <option value="Xenova/whisper-tiny.en">Fast, English (about 40 MB, once)</option>
+          <option value="Xenova/whisper-base.en">Accurate, English (about 80 MB, once)</option>
+          <option value="Xenova/whisper-base">Any language (about 80 MB, once)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="lang">Language</label>
+        <input id="lang" type="text" placeholder="en-US" autocomplete="off" spellcheck="false">
+        <small>Used for live transcripts and the any-language model.</small>
+      </div>
+      <label class="row-toggle">
+        <span><strong>Keep audio recordings</strong><small>Saves the audio on this device so you can replay a note.</small></span>
+        <input type="checkbox" id="keepAudio" checked>
+      </label>
+    </fieldset>
+
+    <fieldset class="group">
+      <legend>Your data</legend>
+      <p class="muted small" id="storageNote">Notes are saved in this browser.</p>
+      <div class="btn-row">
+        <button class="btn btn-ghost" type="button" id="exportMd">Export Markdown</button>
+        <button class="btn btn-ghost" type="button" id="exportJson">Export backup</button>
+        <label class="btn btn-ghost file-btn" for="importJson" id="importJsonLabel">Restore backup</label>
+        <input type="file" id="importJson" accept="application/json,.json">
+      </div>
+      <div class="danger">
+        <button class="btn btn-danger" type="button" id="clearAll">Delete all notes</button>
+        <div class="confirm" id="clearConfirm" hidden>
+          <span>Delete every note and thought? This can't be undone.</span>
+          <button class="btn btn-danger" type="button" id="clearYes">Delete everything</button>
+          <button class="btn btn-quiet" type="button" id="clearNo">Keep them</button>
+        </div>
+      </div>
+    </fieldset>
+  </form>
+</dialog>
+
+<div class="toast" id="toast" role="status" aria-live="polite" hidden>
+  <span id="toastText"></span>
+  <button class="toast-action" id="toastAction" type="button" hidden>Undo</button>
+</div>
+
+<script src="src/engine.js"></script>
+<script src="src/app.js"></script>
+<!-- build:page-end -->
+<script>
+  if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+    window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+  }
+</script>
+</body>
+</html>
