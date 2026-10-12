@@ -140,3 +140,19 @@ test('alignThoughts finds when each thought was said, even after small rewrites'
   assert.equal(starts[3], 11); // unmatched thoughts inherit the previous time
   assert.deepEqual(E.alignThoughts([{ text: 'x' }], { words: [], starts: [] }), [null]);
 });
+
+test('toGeminiSchema converts the sorting schema to Gemini format', () => {
+  const g = E.toGeminiSchema(E.CLAUDE_SCHEMA);
+  assert.equal(g.type, 'OBJECT');
+  assert.deepEqual(g.propertyOrdering, ['title', 'mood', 'thoughts']);
+  assert.ok(!('additionalProperties' in g));
+  const item = g.properties.thoughts.items;
+  assert.equal(item.type, 'OBJECT');
+  assert.ok(!('additionalProperties' in item));
+  assert.deepEqual(item.required, ['text', 'kind', 'topics', 'due']);
+  assert.equal(item.properties.kind.format, 'enum');
+  assert.deepEqual(item.properties.kind.enum, E.KIND_IDS);
+  assert.equal(item.properties.topics.items.type, 'STRING');
+  // The shared schema itself is left untouched.
+  assert.equal(E.CLAUDE_SCHEMA.type, 'object');
+});

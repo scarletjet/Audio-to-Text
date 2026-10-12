@@ -137,7 +137,7 @@ svg { flex: none; }
 }
 .engine-pill span:last-child { overflow: hidden; text-overflow: ellipsis; }
 .engine-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
-.engine-pill[data-engine="claude"] .engine-dot { background: var(--accent); }
+.engine-pill[data-engine="ai"] .engine-dot { background: var(--accent); }
 .icon-btn {
   display: inline-grid; place-items: center;
   width: 40px; height: 40px; border-radius: 12px;
@@ -447,6 +447,7 @@ textarea:focus { outline: 2px solid var(--focus); outline-offset: 0; border-colo
 .job-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .job-actions .btn { min-height: 36px; padding: 0 12px; font-size: 0.875rem; }
 .field-status { color: var(--ink) !important; }
+.sub-fields { display: grid; gap: 12px; padding-left: 12px; border-left: 2px solid var(--line); }
 .field-status:empty { display: none !important; }
 
 .player {
