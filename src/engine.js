@@ -527,6 +527,113 @@
     return { notes: recent.length, thoughts: thoughtsCount, byKind, topics, openTodos, moods };
   }
 
+  // ---- Long transcripts ------------------------------------------------------
+
+  /** Split text into pieces of at most maxChars, preferring paragraph, then sentence breaks. */
+  function chunkText(text, maxChars) {
+    const max = maxChars || 24000;
+    const src = normalize(text).trim();
+    if (src.length <= max) return src ? [src] : [];
+    const pieces = [];
+    for (const para of src.split(/\n\s*\n|\n/)) {
+      if (para.length <= max) {
+        pieces.push(para);
+        continue;
+      }
+      let buf = '';
+      for (const sentence of para.split(/(?<=[.!?])\s+/)) {
+        if (sentence.length > max) {
+          // No usable punctuation: fall back to a hard cut on a space.
+          for (let i = 0; i < sentence.length; ) {
+            let end = Math.min(sentence.length, i + max);
+            if (end < sentence.length) {
+              const sp = sentence.lastIndexOf(' ', end);
+              if (sp > i) end = sp;
+            }
+            pieces.push(sentence.slice(i, end).trim());
+            i = end;
+          }
+        } else if ((buf + ' ' + sentence).length > max) {
+          pieces.push(buf.trim());
+          buf = sentence;
+        } else {
+          buf = buf ? buf + ' ' + sentence : sentence;
+        }
+      }
+      if (buf.trim()) pieces.push(buf.trim());
+    }
+    const chunks = [];
+    let cur = '';
+    for (const p of pieces.filter(Boolean)) {
+      if (cur && cur.length + p.length + 2 > max) {
+        chunks.push(cur);
+        cur = p;
+      } else {
+        cur = cur ? cur + '\n\n' + p : p;
+      }
+    }
+    if (cur) chunks.push(cur);
+    return chunks;
+  }
+
+  const FILLER_WORDS = new Set(['um', 'umm', 'uh', 'uhh', 'uhm', 'erm', 'er', 'hmm', 'hm', 'mhm', 'ah']);
+
+  /** Lowercase words without punctuation or filler, for matching text against timestamps. */
+  function normWords(text) {
+    return (normalize(text).toLowerCase().match(/[a-z0-9']+/g) || []).map((w) => w.replace(/'/g, '')).filter((w) => w && !FILLER_WORDS.has(w));
+  }
+
+  /** Turn word timestamps ({word|punctuated_word, start}) into a compact lookup. */
+  function buildTiming(words) {
+    const out = { words: [], starts: [] };
+    for (const w of words || []) {
+      const norm = normWords(w.punctuated_word || w.word || '');
+      for (const n of norm) {
+        out.words.push(n);
+        out.starts.push(Math.round((Number(w.start) || 0) * 10) / 10);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Find when each thought was said. Thoughts are matched in order against the
+   * timed words, tolerating small rewrites; a thought that can't be found gets
+   * the start of the one before it.
+   */
+  function alignThoughts(thoughts, timing) {
+    const W = (timing && timing.words) || [];
+    const S = (timing && timing.starts) || [];
+    let cursor = 0;
+    let last = W.length ? S[0] : null;
+    return thoughts.map((t) => {
+      const tw = normWords(t.text).slice(0, 4);
+      if (!tw.length || !W.length) return last;
+      const need = Math.min(3, tw.length);
+      const limit = Math.min(W.length, cursor + 4000);
+      let found = -1;
+      for (let p = cursor; p < limit && found < 0; p++) {
+        if (W[p] !== tw[0] && W[p] !== tw[1]) continue;
+        let hits = 0;
+        let q = p;
+        for (const w of tw) {
+          for (let k = q; k <= Math.min(W.length - 1, p + 6); k++) {
+            if (W[k] === w) {
+              hits++;
+              q = k + 1;
+              break;
+            }
+          }
+        }
+        if (hits >= need) found = p;
+      }
+      if (found < 0) return last;
+      cursor = found + 1;
+      last = S[found];
+      return last;
+    });
+  }
+
   const api = {
     KINDS,
     KIND_IDS,
@@ -541,6 +648,10 @@
     learn,
     tokens,
     summarize,
+    chunkText,
+    normWords,
+    buildTiming,
+    alignThoughts,
     CLAUDE_SCHEMA,
     buildClaudePrompt,
     buildReflectionPrompt,
