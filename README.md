@@ -2,6 +2,8 @@
 
 Talk into your phone and get your thoughts back, sorted.
 
+**Open it:** [thought-sorter.vercel.app](https://thought-sorter.vercel.app). On your phone, use "Add to Home Screen" to install it as an app.
+
 Thought Sorter turns voice notes into text, splits each note into the separate thoughts it contains, and files every thought by what kind of thought it is:
 
 | Kind | What lands there |
@@ -53,7 +55,7 @@ It's a static site with no build step:
 npm start            # serves on http://localhost:8080
 ```
 
-Recording needs a secure page, so use `localhost` or any `https://` host. To use it on your phone, deploy the folder to any static host (GitHub Pages, Netlify, Vercel, Cloudflare Pages) and open the URL. "Add to Home Screen" installs it as an app that works offline.
+Recording needs a secure page, so use `localhost` or any `https://` host. The live site is deployed on Vercel from this repo's default branch, and every push redeploys it. Any static host works too (GitHub Pages, Netlify, Cloudflare Pages). "Add to Home Screen" installs it as an app that works offline.
 
 ## Claude.ai version
 
