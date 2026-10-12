@@ -118,9 +118,15 @@
     whisperModel: 'Xenova/whisper-tiny.en',
     lang: '',
     keepAudio: true,
+    sorter: 'device', // 'device', 'gemini' (free Google key) or 'claude' (Anthropic key)
+    geminiKey: '',
+    geminiModel: 'gemini-3.8-flash',
   };
-  const settings = Object.assign({}, DEFAULTS, readJSON(SETTINGS_KEY, {}));
+  const savedSettings = readJSON(SETTINGS_KEY, {}) || {};
+  const settings = Object.assign({}, DEFAULTS, savedSettings);
   if (settings.speechMode === 'whisper') settings.speechMode = 'after';
+  // Earlier versions only had Claude; keep anyone who set it up on Claude.
+  if (!savedSettings.sorter) settings.sorter = savedSettings.apiKey && savedSettings.useClaude !== false ? 'claude' : 'device';
   const saveSettings = () => writeJSON(SETTINGS_KEY, settings);
   const useDeepgram = () => !IN_VIEWER && settings.transcriber === 'deepgram' && !!settings.dgKey;
 
@@ -137,8 +143,8 @@
     tab: 'thoughts',
     days: 7,
     moving: null,
-    claudeBusy: new Set(),
-    claudeStatus: {},
+    aiBusy: new Set(),
+    aiStatus: {},
     reflection: '',
   };
   const caps = { sample: null, downloads: null, claudeDenied: false };
@@ -303,17 +309,33 @@
         pump();
       });
     }
+    // A stored document holds at most 256 KiB, so a very long transcript is
+    // kept in pieces next to its note and joined back together on load.
+    const PIECE_CHARS = 60000;
+    const pieceCount = new Map();
+    const strip = (o) => JSON.parse(JSON.stringify(o));
     const parse = (snap) => {
       const notes = [];
+      const pieces = {};
       let meta = null;
       for (const d of snap.docs) {
-        const v = d.data() || {};
+        // Delivered data is read-only; copy it so the app can edit notes.
+        const v = strip(d.data() || {});
         if (v.type === 'note') notes.push(v);
+        else if (v.type === 'transcript') (pieces[v.noteId] = pieces[v.noteId] || []).push(v);
         else if (v.type === 'meta') meta = v;
+      }
+      for (const n of notes) {
+        pieceCount.set(n.id, n.transcriptParts || 0);
+        if (n.transcriptParts) {
+          n.transcript = (pieces[n.id] || [])
+            .sort((a, b) => a.i - b.i)
+            .map((p) => p.text)
+            .join('');
+        }
       }
       return { notes, meta };
     };
-    const strip = (o) => JSON.parse(JSON.stringify(o));
     return {
       kind: 'db',
       async loadAll() {
@@ -321,10 +343,35 @@
         return { notes: r.notes, meta: r.meta || { lexicon: {}, corrections: [] } };
       },
       saveNote(note) {
-        return write('n_' + note.id, () => col.doc('n_' + note.id).set(strip(Object.assign({}, note, { type: 'note' }))));
+        const doc = strip(Object.assign({}, note, { type: 'note' }));
+        const pieces = [];
+        if (new TextEncoder().encode(JSON.stringify(doc)).length > 200 * 1024) {
+          const text = doc.transcript || '';
+          for (let i = 0; i < text.length; i += PIECE_CHARS) pieces.push(text.slice(i, i + PIECE_CHARS));
+          doc.transcript = '';
+        }
+        doc.transcriptParts = pieces.length;
+        const before = pieceCount.get(note.id) || 0;
+        pieceCount.set(note.id, pieces.length);
+        const jobs = pieces.map((text, i) => {
+          const id = 'n_' + note.id + '_t' + i;
+          return write(id, () => col.doc(id).set({ type: 'transcript', noteId: note.id, i, text }));
+        });
+        for (let i = pieces.length; i < before; i++) {
+          const id = 'n_' + note.id + '_t' + i;
+          jobs.push(write(id, () => col.doc(id).delete()));
+        }
+        jobs.push(write('n_' + note.id, () => col.doc('n_' + note.id).set(doc)));
+        return Promise.all(jobs);
       },
       deleteNote(id) {
-        return write('n_' + id, () => col.doc('n_' + id).delete());
+        const jobs = [write('n_' + id, () => col.doc('n_' + id).delete())];
+        for (let i = 0; i < (pieceCount.get(id) || 0); i++) {
+          const pid = 'n_' + id + '_t' + i;
+          jobs.push(write(pid, () => col.doc(pid).delete()));
+        }
+        pieceCount.delete(id);
+        return Promise.all(jobs);
       },
       saveMeta() {
         return write('meta', () => col.doc('meta').set(strip({ type: 'meta', lexicon: state.meta.lexicon, corrections: state.meta.corrections })));
@@ -432,10 +479,77 @@
   // ---------------------------------------------------------------------
   // Claude
   // ---------------------------------------------------------------------
-  function claudeReady() {
-    if (!settings.useClaude || caps.claudeDenied) return false;
-    if (IN_VIEWER) return !!caps.sample;
-    return !!settings.apiKey;
+  // Which AI, if any, takes a second pass after the instant on-device sort.
+  // Inside claude.ai it's the viewer's own Claude account; elsewhere it's
+  // Gemini or Claude with the person's own key.
+  function aiProvider() {
+    if (IN_VIEWER) return settings.useClaude && caps.sample && !caps.claudeDenied ? 'claude' : null;
+    if (settings.sorter === 'gemini' && settings.geminiKey) return 'gemini';
+    if (settings.sorter === 'claude' && settings.apiKey) return 'claude';
+    return null;
+  }
+  const AI_NAMES = { claude: 'Claude', gemini: 'Gemini' };
+  const aiReady = () => !!aiProvider();
+  const aiName = () => AI_NAMES[aiProvider()] || 'AI';
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  // ---- Gemini: free tier with a Google AI Studio key ------------------------
+  const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/';
+
+  async function geminiGenerate(prompt, schema, onWait) {
+    const model = settings.geminiModel || DEFAULTS.geminiModel;
+    let useSchema = !!schema;
+    for (let attempt = 0; ; attempt++) {
+      const generationConfig = {};
+      if (schema) generationConfig.responseMimeType = 'application/json';
+      if (useSchema) generationConfig.responseSchema = E.toGeminiSchema(schema);
+      let res;
+      try {
+        res = await fetch(GEMINI_URL + encodeURIComponent(model) + ':generateContent', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': settings.geminiKey },
+          body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig }),
+        });
+      } catch (_) {
+        throw Object.assign(new Error("Couldn't reach Gemini."), { provider: 'gemini', network: true });
+      }
+      const data = await res.json().catch(() => null);
+      if (res.ok) {
+        const cand = data && data.candidates && data.candidates[0];
+        const parts = (cand && cand.content && cand.content.parts) || [];
+        const text = parts.map((p) => (p.thought ? '' : p.text || '')).join('');
+        if (text.trim()) return text;
+        const blocked = (data && data.promptFeedback && data.promptFeedback.blockReason) || /SAFETY|PROHIBITED|BLOCKLIST|RECITATION/.test((cand && cand.finishReason) || '');
+        throw Object.assign(new Error(blocked ? 'Gemini declined this note.' : 'Gemini sent back an empty answer.'), { provider: 'gemini', code: blocked ? 'refused' : 'empty' });
+      }
+      const err = (data && data.error) || {};
+      const message = err.message || 'Gemini error ' + res.status;
+      const details = Array.isArray(err.details) ? err.details : [];
+      // If Gemini can't read the schema, ask for plain JSON instead.
+      if (res.status === 400 && useSchema && /schema|Invalid JSON payload|Unknown name|Cannot find field/i.test(message)) {
+        useSchema = false;
+        continue;
+      }
+      if (res.status === 429) {
+        // The free tier allows a few requests a minute: wait as told and retry.
+        const daily = /PerDay|per day/i.test(message + JSON.stringify(details));
+        const retry = details.find((d) => d && d.retryDelay);
+        const hinted = retry ? parseFloat(retry.retryDelay) : parseFloat((message.match(/retry in ([\d.]+)\s*s/i) || [])[1]);
+        const seconds = Math.min(60, Math.max(5, Math.ceil(hinted || 20)));
+        if (!daily && attempt < 3) {
+          if (onWait) onWait(seconds);
+          await sleep(seconds * 1000);
+          continue;
+        }
+        throw Object.assign(new Error(message), { provider: 'gemini', status: 429, daily });
+      }
+      if ((res.status === 500 || res.status === 503) && attempt < 2) {
+        await sleep(3000 * (attempt + 1));
+        continue;
+      }
+      const reason = (details.find((d) => d && d.reason) || {}).reason;
+      throw Object.assign(new Error(message), { provider: 'gemini', status: res.status, reason });
+    }
   }
 
   let anthropicClient = null;
@@ -478,11 +592,13 @@
     }
   }
 
-  async function claudeSortPart(text) {
+  async function aiSortPart(text, onWait) {
     const prompt = E.buildClaudePrompt(text, state.meta.corrections);
     let data;
     if (IN_VIEWER) {
       data = await caps.sample.json(prompt, { modelTier: 'quick' });
+    } else if (aiProvider() === 'gemini') {
+      data = parseJSONLoose(await geminiGenerate(prompt, E.CLAUDE_SCHEMA, onWait));
     } else {
       data = parseJSONLoose(await apiMessage(prompt, { type: 'json_schema', schema: E.CLAUDE_SCHEMA }));
     }
@@ -491,70 +607,90 @@
 
   // Long transcripts are sorted in sections (about 20 minutes of talk each)
   // so nothing gets cut off, then stitched back together in order.
-  async function claudeSort(transcript, onProgress) {
+  async function aiSort(transcript, onProgress, onWait) {
     const parts = E.chunkText(transcript, 18000);
-    if (parts.length <= 1) return claudeSortPart(transcript);
+    if (parts.length <= 1) return aiSortPart(transcript, onWait);
     const results = [];
     for (let i = 0; i < parts.length; i++) {
       if (onProgress) onProgress(i + 1, parts.length);
-      results.push(await claudeSortPart(parts[i]));
+      results.push(await aiSortPart(parts[i], onWait));
     }
     const thoughts = results.flatMap((r) => r.thoughts);
     const mood = E.moodOf(transcript);
     return { title: results[0].title, text: transcript, thoughts, mood };
   }
 
-  async function claudeText(prompt, onText) {
+  async function aiText(prompt, onText) {
     if (IN_VIEWER) {
       const r = await caps.sample(prompt, { onText: (u) => onText(u.text), cache: false });
       return r.text;
     }
-    const text = await apiMessage(prompt);
+    const text = aiProvider() === 'gemini' ? await geminiGenerate(prompt, null, (s) => onText('Waiting ' + s + ' seconds for Gemini’s free tier…')) : await apiMessage(prompt);
     onText(text);
     return text;
   }
 
-  function claudeErrorMessage(err) {
+  /** What went wrong, in one or two plain sentences. */
+  function aiErrorMessage(err) {
     const code = err && err.code;
+    const status = err && err.status;
+    if (err && err.provider === 'gemini') {
+      if (err.network) return "Couldn't reach Gemini. Check your connection.";
+      if (code === 'refused') return 'Gemini declined this note.';
+      if (code === 'empty') return 'Gemini sent back an empty answer. Try again.';
+      if (status === 429) return err.daily ? "Gemini's free daily limit is used up. Try again tomorrow, or switch to Flash-Lite in Settings." : "Gemini's free tier is busy. Try again in a minute.";
+      if (err.reason === 'API_KEY_INVALID' || (status === 400 && /API key/i.test(err.message))) return 'Google rejected your Gemini key. Check it in Settings.';
+      if (/location is not supported/i.test(err.message)) return "Google's free Gemini tier isn't available in your region.";
+      if (status === 403) return "Your Gemini key isn't allowed to use the Gemini API. Make a new key at aistudio.google.com.";
+      if (status === 404) return "That Gemini model isn't available to your key. Pick another one in Settings.";
+      if (status >= 500) return 'Gemini is having trouble right now. Try again in a bit.';
+      return 'Gemini: ' + err.message;
+    }
     if (['not_granted', 'sampling_disabled', 'not_declared', 'capability_disabled', 'capability_removed'].includes(code)) {
       caps.claudeDenied = true;
       updateEngineUI();
       return "Claude isn't available here, so notes are sorted on this device.";
     }
-    if (code === 'rate_limited') return 'Claude is busy right now. The on-device sort is kept; try Claude again later.';
+    if (code === 'rate_limited') return 'Claude is busy right now. Try again later.';
     if (code === 'session_expired') return 'Sign in to Claude again to use Claude sorting.';
-    if (code === 'refused') return 'Claude declined this note. The on-device sort is kept.';
-    const status = err && err.status;
+    if (code === 'refused') return 'Claude declined this note.';
     if (status === 401) return 'Your Anthropic API key was rejected. Check it in Settings.';
-    if (status === 429) return 'Your API key hit a rate limit. The on-device sort is kept.';
-    if (err && /fetch|network|Failed to/i.test(err.message || '')) return "Couldn't reach Claude. The on-device sort is kept.";
-    return (err && err.message) || 'Claude sorting failed. The on-device sort is kept.';
+    if (status === 429) return 'Your Anthropic API key hit a rate limit. Try again in a minute.';
+    if (err && /fetch|network|Failed to/i.test(err.message || '')) return "Couldn't reach Claude. Check your connection.";
+    return (err && err.message) || 'Sorting with Claude failed.';
   }
 
-  async function refineWithClaude(note, quiet) {
-    if (!claudeReady() || note.example) return;
-    state.claudeBusy.add(note.id);
+  async function refineWithAI(note, quiet) {
+    if (!aiReady() || note.example) return;
+    const provider = aiProvider();
+    const name = AI_NAMES[provider];
+    state.aiBusy.add(note.id);
     renderAll();
+    const setStatus = (text) => {
+      state.aiStatus[note.id] = text;
+      renderNotes();
+    };
     try {
-      const result = await claudeSort(note.transcript, (i, n) => {
-        state.claudeStatus[note.id] = 'section ' + i + ' of ' + n;
-        renderNotes();
-      });
+      const result = await aiSort(
+        note.transcript,
+        (i, n) => setStatus('section ' + i + ' of ' + n),
+        (seconds) => setStatus('(waiting ' + seconds + 's for the free tier)')
+      );
       const current = state.notes.find((n) => n.id === note.id);
       if (!current) return;
       const doneTexts = new Set(current.thoughts.filter((t) => t.done).map((t) => t.text.toLowerCase()));
       current.thoughts = result.thoughts.map((t) => Object.assign({ id: newId(), done: doneTexts.has(t.text.toLowerCase()) }, t));
       current.title = result.title;
       current.mood = result.mood;
-      current.engine = 'claude';
+      current.engine = provider;
       await applyTiming(current);
       await persistNote(current);
-      if (!quiet) toast('Claude sorted this note into ' + plural(current.thoughts.length, 'thought') + '.');
+      if (!quiet) toast(name + ' sorted this note into ' + plural(current.thoughts.length, 'thought') + '.');
     } catch (err) {
-      if (!(err && err.code === 'cancelled')) toast(claudeErrorMessage(err));
+      if (!(err && err.code === 'cancelled')) toast(aiErrorMessage(err) + ' Your on-device sort is kept.');
     } finally {
-      state.claudeBusy.delete(note.id);
-      delete state.claudeStatus[note.id];
+      state.aiBusy.delete(note.id);
+      delete state.aiStatus[note.id];
       renderAll();
     }
   }
@@ -606,9 +742,9 @@
     }
     renderAll();
     bumpKinds(note.thoughts.map((t) => t.kind));
-    if (claudeReady()) {
-      toast('Sorted ' + plural(note.thoughts.length, 'thought') + '. Claude is taking a closer look.');
-      refineWithClaude(note, false);
+    if (aiReady()) {
+      toast('Sorted ' + plural(note.thoughts.length, 'thought') + '. ' + aiName() + ' is taking a closer look.');
+      refineWithAI(note, false);
     } else {
       toast('Sorted ' + plural(note.thoughts.length, 'thought') + ' from your note.');
     }
@@ -1569,7 +1705,7 @@ self.onmessage = async (e) => {
       ...notes.map((n) => {
         const counts = {};
         for (const t of n.thoughts) counts[t.kind] = (counts[t.kind] || 0) + 1;
-        const busy = state.claudeBusy.has(n.id);
+        const busy = state.aiBusy.has(n.id);
         const details = h('details', { class: 'note', 'data-id': n.id, open: open.has(n.id) });
         const summary = h(
           'summary',
@@ -1583,7 +1719,7 @@ self.onmessage = async (e) => {
             h('span', { text: plural(n.thoughts.length, 'thought') }),
             n.duration ? h('span', { text: SOURCE_LABEL[n.source] + ' · ' + clock(n.duration) }) : h('span', { text: SOURCE_LABEL[n.source] || 'Note' }),
             n.mood ? h('span', { class: 'mood', text: n.mood.label }) : null,
-            busy ? h('span', { text: 'Claude is sorting' + (state.claudeStatus[n.id] ? ' ' + state.claudeStatus[n.id] : '') + '…' }) : n.engine === 'claude' ? h('span', { text: 'Sorted by Claude' }) : null,
+            busy ? h('span', { text: aiName() + ' is sorting' + (state.aiStatus[n.id] ? ' ' + state.aiStatus[n.id] : '') + '…' }) : AI_NAMES[n.engine] ? h('span', { text: 'Sorted by ' + AI_NAMES[n.engine] }) : null,
             n.example ? h('span', { class: 'tag tag-example', text: 'Example' }) : null
           )
         );
@@ -1595,6 +1731,17 @@ self.onmessage = async (e) => {
         return details;
       })
     );
+  }
+
+  function copyTranscript(n, btn) {
+    const fallback = () => {
+      const ta = btn.closest('.note-body').querySelector('textarea');
+      ta.focus();
+      ta.select();
+      toast('Transcript selected. Use Copy on your device to copy it.');
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(n.transcript || '').then(() => toast('Transcript copied.'), fallback);
+    else fallback();
   }
 
   function noteBody(n) {
@@ -1628,14 +1775,15 @@ self.onmessage = async (e) => {
     }
     body.append(thoughtsBox);
     if (!n.example) {
-      const busy = state.claudeBusy.has(n.id);
+      const busy = state.aiBusy.has(n.id);
       body.append(
         h(
           'div',
           { class: 'btn-row' },
           save,
+          h('button', { class: 'btn btn-ghost', type: 'button', onclick: (e) => copyTranscript(n, e.currentTarget) }, 'Copy transcript'),
           h('button', { class: 'btn btn-ghost', type: 'button', onclick: () => resortNote(n, n.transcript) }, 'Re-sort on device'),
-          claudeReady() ? h('button', { class: 'btn btn-ghost', type: 'button', disabled: busy, onclick: () => refineWithClaude(n) }, busy ? 'Claude is sorting…' : 'Sort with Claude') : null,
+          aiReady() ? h('button', { class: 'btn btn-ghost', type: 'button', disabled: busy, onclick: () => refineWithAI(n) }, busy ? aiName() + ' is sorting…' : 'Sort with ' + aiName()) : null,
           h('button', { class: 'btn btn-danger', type: 'button', onclick: () => deleteNote(n.id) }, 'Delete note')
         )
       );
@@ -1667,7 +1815,7 @@ self.onmessage = async (e) => {
       .filter(([, v]) => v)
       .map(([k, v]) => plural(v, k.toLowerCase() + ' note', k.toLowerCase() + ' notes'))
       .join(', ');
-    const reflectBtn = claudeReady() && !state.showingExamples ? h('button', { class: 'btn btn-primary', type: 'button', id: 'reflectBtn', onclick: reflect }, 'Write my reflection') : null;
+    const reflectBtn = aiReady() && !state.showingExamples ? h('button', { class: 'btn btn-primary', type: 'button', id: 'reflectBtn', onclick: reflect }, 'Write my reflection') : null;
     box.replaceChildren(
       h(
         'div',
@@ -1714,9 +1862,9 @@ self.onmessage = async (e) => {
         'div',
         { class: 'panel' },
         h('h3', { text: 'Reflection' }),
-        claudeReady()
-          ? h('p', { class: 'muted small', text: state.showingExamples ? 'Record a few notes, then Claude can write you a reflection on what keeps coming up.' : 'Claude reads the thoughts from this period and writes back what keeps coming up, ideas worth chasing, and loose ends.' })
-          : h('p', { class: 'muted small', text: IN_VIEWER ? 'Turn on Claude sorting in Settings to get a written reflection.' : 'Add an Anthropic API key in Settings to get a written reflection from Claude.' }),
+        aiReady()
+          ? h('p', { class: 'muted small', text: state.showingExamples ? 'Record a few notes, then ' + aiName() + ' can write you a reflection on what keeps coming up.' : aiName() + ' reads the thoughts from this period and writes back what keeps coming up, ideas worth chasing, and loose ends.' })
+          : h('p', { class: 'muted small', text: IN_VIEWER ? 'Turn on Claude sorting in Settings to get a written reflection.' : 'Choose Gemini (free) or Claude under Settings → Sorting to get a written reflection.' }),
         reflectBtn,
         h('div', { class: 'reflection', id: 'reflection', text: state.reflection })
       )
@@ -1733,14 +1881,14 @@ self.onmessage = async (e) => {
     btn.textContent = 'Thinking…';
     out.textContent = '';
     try {
-      state.reflection = await claudeText(E.buildReflectionPrompt(notes, state.days), (text) => {
+      state.reflection = await aiText(E.buildReflectionPrompt(notes, state.days), (text) => {
         state.reflection = text;
         const el = $('reflection');
         if (el) el.textContent = text;
       });
     } catch (err) {
       state.reflection = (err && err.text) || '';
-      toast(claudeErrorMessage(err).replace('The on-device sort is kept.', '').trim() || "Couldn't write a reflection right now.");
+      toast(aiErrorMessage(err) || "Couldn't write a reflection right now.");
     } finally {
       renderPatterns();
     }
@@ -1763,11 +1911,12 @@ self.onmessage = async (e) => {
   }
 
   function updateEngineUI() {
-    const on = claudeReady();
-    $('enginePill').dataset.engine = on ? 'claude' : 'device';
-    $('engineLabel').textContent = on ? 'Claude' : 'On device';
-    $('enginePill').title = on ? 'Notes are sorted by Claude. Tap to change.' : 'Notes are sorted on this device. Tap to change.';
-    $('enginePill').setAttribute('aria-label', on ? 'Sorting with Claude. Open settings.' : 'Sorting on this device. Open settings.');
+    const on = aiReady();
+    const name = aiName();
+    $('enginePill').dataset.engine = on ? 'ai' : 'device';
+    $('engineLabel').textContent = on ? name : 'On device';
+    $('enginePill').title = on ? 'Notes are sorted by ' + name + '. Tap to change.' : 'Notes are sorted on this device. Tap to change.';
+    $('enginePill').setAttribute('aria-label', on ? 'Sorting with ' + name + '. Open settings.' : 'Sorting on this device. Open settings.');
   }
 
   function applyModeUI() {
@@ -1782,17 +1931,21 @@ self.onmessage = async (e) => {
       $('importText').textContent = 'Import transcripts';
       $('fileInput').setAttribute('accept', '.txt,.md,.vtt,.srt,text/plain');
       $('speechGroup').hidden = true;
-      $('apiKeyField').hidden = true;
-      $('modelField').hidden = true;
-      $('claudeHelp').textContent = 'Uses your Claude account to split and label notes with more nuance. Claude asks your permission the first time.';
+      $('sorterField').hidden = true;
+      $('geminiFields').hidden = true;
+      $('claudeFields').hidden = true;
+      $('claudeHelp').textContent = 'Uses your Claude account to split and label notes with more nuance, at no extra cost. Claude asks your permission the first time.';
     } else {
-      $('claudeHelp').textContent = 'Claude splits and labels your notes with more nuance. Needs your Anthropic API key below.';
+      $('useClaudeRow').hidden = true;
     }
   }
 
   function fillSettings() {
     $('useClaude').checked = settings.useClaude;
-    $('useClaudeRow').hidden = IN_VIEWER && !caps.sample;
+    $('useClaudeRow').hidden = !IN_VIEWER || !caps.sample;
+    $('sorter').value = settings.sorter;
+    $('geminiKey').value = settings.geminiKey;
+    $('geminiModel').value = settings.geminiModel;
     $('apiKey').value = settings.apiKey;
     $('claudeModel').value = settings.claudeModel;
     $('tidy').checked = settings.tidy;
@@ -1803,6 +1956,7 @@ self.onmessage = async (e) => {
     $('dgKey').value = settings.dgKey;
     $('whisperModel').value = settings.whisperModel;
     syncSpeechFields();
+    syncSortFields();
     $('lang').value = settings.lang;
     $('lang').placeholder = navigator.language || 'en-US';
     $('keepAudio').checked = settings.keepAudio;
@@ -1817,6 +1971,19 @@ self.onmessage = async (e) => {
     $('dgKeyField').hidden = !deepgram;
     $('whisperField').hidden = deepgram && !!$('dgKey').value.trim();
     $('dgStatus').textContent = deepgram ? ($('dgKey').value.trim() ? 'Deepgram is set up. Imports and after-you-stop recordings use it.' : 'Add your key to start using Deepgram. Until then, audio is transcribed on this device.') : '';
+  }
+
+  function syncSortFields() {
+    if (IN_VIEWER) return;
+    const sorter = $('sorter').value;
+    $('geminiFields').hidden = sorter !== 'gemini';
+    $('claudeFields').hidden = sorter !== 'claude';
+    const status = {
+      device: 'Free and private. It learns from your Move corrections.',
+      gemini: $('geminiKey').value.trim() ? 'Gemini is set up. New notes get a second pass from Gemini.' : 'Add your free key below to turn Gemini on. Until then, notes are sorted on this device.',
+      claude: $('apiKey').value.trim() ? 'Claude is set up. New notes get a second pass from Claude.' : 'Add your Anthropic key below to turn Claude on. Until then, notes are sorted on this device.',
+    };
+    $('sorterStatus').textContent = status[sorter] || '';
   }
 
   function openSettings() {
@@ -1840,11 +2007,17 @@ self.onmessage = async (e) => {
         saveSettings();
         updateEngineUI();
         syncSpeechFields();
+        syncSortFields();
         if (!rec) setRecordingUI('idle');
         renderAll();
       });
     };
     bind('useClaude', 'useClaude', 'checked');
+    bind('sorter', 'sorter', 'value');
+    bind('geminiKey', 'geminiKey', 'value');
+    bind('geminiModel', 'geminiModel', 'value');
+    $('geminiKey').addEventListener('input', syncSortFields);
+    $('apiKey').addEventListener('input', syncSortFields);
     bind('apiKey', 'apiKey', 'value');
     bind('claudeModel', 'claudeModel', 'value');
     bind('tidy', 'tidy', 'checked');

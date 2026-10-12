@@ -426,6 +426,23 @@
     },
   };
 
+  /** Gemini reads an OpenAPI-style schema: upper-case types and no additionalProperties. */
+  function toGeminiSchema(s) {
+    if (Array.isArray(s)) return s.map(toGeminiSchema);
+    if (!s || typeof s !== 'object') return s;
+    const out = {};
+    for (const [k, v] of Object.entries(s)) {
+      if (k === 'additionalProperties') continue;
+      if (k === 'type') out.type = String(v).toUpperCase();
+      else if (k === 'properties') out.properties = Object.fromEntries(Object.entries(v).map(([pk, pv]) => [pk, toGeminiSchema(pv)]));
+      else if (k === 'items') out.items = toGeminiSchema(v);
+      else out[k] = v;
+    }
+    if (out.enum && out.type === 'STRING') out.format = 'enum';
+    if (out.properties) out.propertyOrdering = Object.keys(out.properties);
+    return out;
+  }
+
   function buildClaudePrompt(transcript, examples) {
     const kinds = KINDS.map((k) => `- ${k.id}: ${k.blurb}`).join('\n');
     const topics = TOPICS.map((t) => t.id).join(', ');
@@ -653,6 +670,7 @@
     buildTiming,
     alignThoughts,
     CLAUDE_SCHEMA,
+    toGeminiSchema,
     buildClaudePrompt,
     buildReflectionPrompt,
     normalizeClaudeResult,

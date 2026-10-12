@@ -41,9 +41,16 @@ Deepgram returns the time of every word, so each thought gets a time stamp like 
 
 ## Sorting
 
-- **On-device (default)**: a fast rule-based engine (`src/engine.js`) that handles punctuated text and the unpunctuated run-on text browser dictation produces. It needs no network.
-- **It learns from you**: tap **Move** on any thought to re-file it. The words in that thought then lean toward the category you picked, so similar thoughts land there next time.
-- **Claude (optional)**: for more nuanced splitting and labeling, turn on *Sort with Claude* in Settings and add an Anthropic API key. Your corrections are passed along so Claude follows your preferences. The on-device sort shows instantly, then Claude's version replaces it a moment later. Long transcripts are sorted in sections of about 20 minutes each, so nothing is cut off.
+Choose how thoughts are sorted under *Settings → Sorting*:
+
+- **This device (free, the default)**: a fast rule-based engine (`src/engine.js`) that handles punctuated text and the unpunctuated run-on text browser dictation produces. No account, no network.
+- **Gemini (free)**: get a free API key at [aistudio.google.com](https://aistudio.google.com) (sign in with Google, choose *Get API key*, no card needed) and paste it in. Gemini 3.8 Flash (or the faster 3.5 Flash-Lite) takes a second pass at each note. When the free tier's per-minute limit is hit, the app waits and retries on its own. On Google's free tier, what you send may be used to improve Google's models.
+- **Claude**: paste an Anthropic API key and pick a model. Claude Haiku 5.5 costs under a penny per hour of talking.
+- **Your Claude account, no key**: open the [claude.ai version](#claudeai-version) and sorting runs on your own Claude plan.
+
+The on-device sort shows instantly, and an AI's version replaces it a moment later. Long transcripts are sorted in sections of about 20 minutes each, so nothing is cut off.
+
+**It learns from you:** tap **Move** on any thought to re-file it. The words in that thought then lean toward the category you picked, so similar thoughts land there next time. Your corrections are also passed to Gemini or Claude so they follow your preferences.
 
 ## Patterns
 
@@ -55,7 +62,8 @@ The **Patterns** tab shows what you think about most over 7 days, 30 days or all
 - With Deepgram set up, audio you transcribe goes directly from your browser to Deepgram using your key.
 - On-device Whisper downloads its model once (about 40 MB for the fast English model) and caches it. Nothing leaves the device.
 - Live transcripts use your browser's built-in speech service. Some browsers send audio to their provider for this.
-- With Claude turned on, note text goes directly from your browser to the Anthropic API using your key.
+- With Gemini or Claude turned on, note text goes directly from your browser to Google or Anthropic using your key. On Google's free tier, Google may use it to improve its models.
+- In the claude.ai version, sorting runs through your Claude account and notes are stored in your account's private space for that page.
 - **Export backup** and **Restore backup** in Settings move your notes between devices. **Export Markdown** gives you a readable copy grouped by kind.
 
 ## Run it
@@ -70,11 +78,13 @@ Recording needs a secure page, so use `localhost` or any `https://` host. The li
 
 ## Claude.ai version
 
-`npm run build:artifact` writes `dist/thought-sorter.html`, a single self-contained page for publishing as a claude.ai Artifact. When it runs there, it adapts:
+The same app runs inside claude.ai, where it uses your Claude login instead of an API key: https://claude.ai/artifact/EyvAQDxYNQtP6mpwxHQVae
 
-- Sorting and reflections use the viewer's own Claude account, so no API key is needed.
-- Notes are saved privately to the viewer's Claude account and sync across their devices.
-- The claude.ai frame blocks the microphone, so capture is keyboard dictation, pasted text, or imported transcripts.
+- Sorting and reflections use your own Claude account at no extra cost.
+- Notes are saved privately to your Claude account and sync across your devices. Very long transcripts are stored in pieces, so hours of text fit.
+- claude.ai pages can't use the microphone or reach Deepgram. Capture there is keyboard dictation, pasted text, or imported transcripts. To get long recordings in, transcribe them in the web app, tap **Copy transcript** on the note, and paste it into the claude.ai version.
+
+`npm run build:artifact` writes `dist/thought-sorter.html`, the single self-contained page published there.
 
 ## Develop
 
