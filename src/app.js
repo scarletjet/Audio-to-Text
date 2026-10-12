@@ -112,13 +112,17 @@
     apiKey: '',
     claudeModel: 'claude-opus-5-5',
     tidy: true,
-    speechMode: 'live',
+    speechMode: 'live', // 'live' (as you talk) or 'after' (transcribe the recording when you stop)
+    transcriber: 'deepgram', // 'deepgram' once a key is set, else 'whisper' on this device
+    dgKey: '',
     whisperModel: 'Xenova/whisper-tiny.en',
     lang: '',
     keepAudio: true,
   };
   const settings = Object.assign({}, DEFAULTS, readJSON(SETTINGS_KEY, {}));
+  if (settings.speechMode === 'whisper') settings.speechMode = 'after';
   const saveSettings = () => writeJSON(SETTINGS_KEY, settings);
+  const useDeepgram = () => !IN_VIEWER && settings.transcriber === 'deepgram' && !!settings.dgKey;
 
   // ---------------------------------------------------------------------
   // App state
@@ -134,6 +138,7 @@
     days: 7,
     moving: null,
     claudeBusy: new Set(),
+    claudeStatus: {},
     reflection: '',
   };
   const caps = { sample: null, downloads: null, claudeDenied: false };
@@ -144,31 +149,122 @@
   const NOTES_KEY = 'thought-sorter.notes.v1';
   const META_KEY = 'thought-sorter.meta.v1';
 
+  // Small IndexedDB helper: returns tx(store, mode, fn) for one database.
+  function idb(name, stores) {
+    let dbp = null;
+    const open = () =>
+      dbp ||
+      (dbp = new Promise((resolve, reject) => {
+        if (!window.indexedDB) return reject(new Error('This browser has no IndexedDB.'));
+        const req = indexedDB.open(name, 1);
+        req.onupgradeneeded = () => {
+          for (const [store, opts] of Object.entries(stores)) req.result.createObjectStore(store, opts || undefined);
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      }));
+    return async (store, mode, fn) => {
+      const db = await open();
+      return new Promise((resolve, reject) => {
+        const t = db.transaction(store, mode);
+        const req = fn(t.objectStore(store));
+        t.oncomplete = () => resolve(req && req.result);
+        t.onerror = () => reject(t.error);
+        t.onabort = () => reject(t.error || new Error('Saving was interrupted.'));
+      });
+    };
+  }
+  const audioTx = idb('thought-sorter-audio', { audio: null });
+  const dataTx = idb('thought-sorter-data', { notes: { keyPath: 'id' }, meta: null, timing: null });
+
+  // Notes live in IndexedDB, which holds far more than localStorage (long
+  // transcripts add up). Other open tabs hear about changes over a channel.
+  const channel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('thought-sorter') : null;
+  const announce = () => channel && channel.postMessage('changed');
+
   const LocalBackend = {
     kind: 'local',
+    useIdb: true,
     async loadAll() {
-      return { notes: readJSON(NOTES_KEY, []), meta: readJSON(META_KEY, { lexicon: {}, corrections: [] }) };
+      try {
+        let notes = await dataTx('notes', 'readonly', (s) => s.getAll());
+        let meta = await dataTx('meta', 'readonly', (s) => s.get('meta'));
+        // Move notes saved by the first version out of localStorage.
+        const legacy = readJSON(NOTES_KEY, null);
+        if (Array.isArray(legacy)) {
+          const have = new Set(notes.map((n) => n.id));
+          const fresh = legacy.filter((n) => n && n.id && !have.has(n.id));
+          if (fresh.length) {
+            await dataTx('notes', 'readwrite', (s) => {
+              let req;
+              for (const n of fresh) req = s.put(n);
+              return req;
+            });
+            notes = notes.concat(fresh);
+          }
+          const legacyMeta = readJSON(META_KEY, null);
+          if (!meta && legacyMeta) {
+            meta = legacyMeta;
+            await dataTx('meta', 'readwrite', (s) => s.put(meta, 'meta'));
+          }
+          try {
+            localStorage.removeItem(NOTES_KEY);
+            localStorage.removeItem(META_KEY);
+          } catch (_) {}
+        }
+        notes.sort((a, b) => b.createdAt - a.createdAt);
+        return { notes, meta: meta || { lexicon: {}, corrections: [] } };
+      } catch (_) {
+        this.useIdb = false;
+        return { notes: readJSON(NOTES_KEY, []), meta: readJSON(META_KEY, { lexicon: {}, corrections: [] }) };
+      }
     },
-    async saveNote() {
-      if (!writeJSON(NOTES_KEY, state.notes)) throw new Error('This browser is out of space for notes. Export a backup and delete old notes.');
+    async saveNote(note) {
+      if (this.useIdb) {
+        await dataTx('notes', 'readwrite', (s) => s.put(JSON.parse(JSON.stringify(note))));
+        announce();
+      } else if (!writeJSON(NOTES_KEY, state.notes)) {
+        throw new Error('This browser is out of space for notes. Export a backup and delete old notes.');
+      }
     },
-    async deleteNote() {
-      writeJSON(NOTES_KEY, state.notes);
+    async deleteNote(id) {
+      if (this.useIdb) {
+        await dataTx('notes', 'readwrite', (s) => s.delete(id));
+        announce();
+      } else {
+        writeJSON(NOTES_KEY, state.notes);
+      }
     },
     async saveMeta() {
-      writeJSON(META_KEY, state.meta);
+      const meta = { lexicon: state.meta.lexicon, corrections: state.meta.corrections };
+      if (this.useIdb) {
+        await dataTx('meta', 'readwrite', (s) => s.put(meta, 'meta'));
+        announce();
+      } else {
+        writeJSON(META_KEY, meta);
+      }
     },
     async clear() {
-      writeJSON(NOTES_KEY, []);
-      writeJSON(META_KEY, { lexicon: {}, corrections: [] });
+      if (this.useIdb) {
+        await dataTx('notes', 'readwrite', (s) => s.clear());
+        await dataTx('meta', 'readwrite', (s) => s.clear());
+        announce();
+      }
+      try {
+        localStorage.removeItem(NOTES_KEY);
+        localStorage.removeItem(META_KEY);
+      } catch (_) {}
     },
     subscribe() {
+      const reload = async () => {
+        const r = await this.loadAll();
+        state.notes = r.notes;
+        state.meta = { lexicon: r.meta.lexicon || {}, corrections: r.meta.corrections || [] };
+        renderAll();
+      };
+      if (channel) channel.onmessage = reload;
       window.addEventListener('storage', (e) => {
-        if (e.key === NOTES_KEY || e.key === META_KEY) {
-          state.notes = readJSON(NOTES_KEY, []);
-          state.meta = readJSON(META_KEY, state.meta);
-          renderAll();
-        }
+        if (e.key === NOTES_KEY || e.key === META_KEY) reload();
       });
     },
   };
@@ -256,7 +352,7 @@
   function persistNote(note) {
     return backend.saveNote(note).catch((err) => {
       const code = err && err.code;
-      if (code === 'quota_exceeded') toast('Your note storage is full. Delete some old notes to save new ones.');
+      if (code === 'quota_exceeded' || (err && err.name === 'QuotaExceededError')) toast('Your note storage is full. Delete some old notes or audio to save new ones.');
       else if (code === 'invalid_argument') toast("This view can't save notes. Ask the owner for Contributor access.");
       else toast((err && err.message) || "Couldn't save that change.");
     });
@@ -265,42 +361,29 @@
     return backend.saveMeta().catch(() => {});
   }
 
-  // Audio blobs stay on this device (IndexedDB), keyed by note id.
+  // Audio blobs and word timings stay on this device, keyed by note id.
   const AudioStore = {
-    dbp: null,
-    open() {
-      if (this.dbp) return this.dbp;
-      this.dbp = new Promise((resolve, reject) => {
-        if (!window.indexedDB) return reject(new Error('no indexedDB'));
-        const req = indexedDB.open('thought-sorter-audio', 1);
-        req.onupgradeneeded = () => req.result.createObjectStore('audio');
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error);
-      });
-      return this.dbp;
-    },
-    async tx(mode, fn) {
-      const db = await this.open();
-      return new Promise((resolve, reject) => {
-        const t = db.transaction('audio', mode);
-        const req = fn(t.objectStore('audio'));
-        t.oncomplete = () => resolve(req && req.result);
-        t.onerror = () => reject(t.error);
-      });
-    },
-    put(id, blob) {
-      return this.tx('readwrite', (s) => s.put(blob, id));
-    },
-    get(id) {
-      return this.tx('readonly', (s) => s.get(id));
-    },
-    del(id) {
-      return this.tx('readwrite', (s) => s.delete(id)).catch(() => {});
-    },
-    clear() {
-      return this.tx('readwrite', (s) => s.clear()).catch(() => {});
-    },
+    put: (id, blob) => audioTx('audio', 'readwrite', (s) => s.put(blob, id)),
+    get: (id) => audioTx('audio', 'readonly', (s) => s.get(id)),
+    del: (id) => audioTx('audio', 'readwrite', (s) => s.delete(id)).catch(() => {}),
+    clear: () => audioTx('audio', 'readwrite', (s) => s.clear()).catch(() => {}),
   };
+  const TimingStore = {
+    put: (id, timing) => dataTx('timing', 'readwrite', (s) => s.put(timing, id)).catch(() => {}),
+    get: (id) => dataTx('timing', 'readonly', (s) => s.get(id)).catch(() => null),
+    del: (id) => dataTx('timing', 'readwrite', (s) => s.delete(id)).catch(() => {}),
+    clear: () => dataTx('timing', 'readwrite', (s) => s.clear()).catch(() => {}),
+  };
+
+  /** Stamp each thought with when it was said, if this note has word timings. */
+  async function applyTiming(note, timing) {
+    const t = timing || (note.timed ? await TimingStore.get(note.id) : null);
+    if (!t || !t.words || !t.words.length) return;
+    const starts = E.alignThoughts(note.thoughts, t);
+    note.thoughts.forEach((th, i) => {
+      if (starts[i] != null) th.start = starts[i];
+    });
+  }
 
   // ---------------------------------------------------------------------
   // Examples shown until the first real note exists (never saved)
@@ -395,15 +478,30 @@
     }
   }
 
-  async function claudeSort(transcript) {
-    const prompt = E.buildClaudePrompt(transcript, state.meta.corrections);
+  async function claudeSortPart(text) {
+    const prompt = E.buildClaudePrompt(text, state.meta.corrections);
     let data;
     if (IN_VIEWER) {
       data = await caps.sample.json(prompt, { modelTier: 'quick' });
     } else {
       data = parseJSONLoose(await apiMessage(prompt, { type: 'json_schema', schema: E.CLAUDE_SCHEMA }));
     }
-    return E.normalizeClaudeResult(data, transcript);
+    return E.normalizeClaudeResult(data, text);
+  }
+
+  // Long transcripts are sorted in sections (about 20 minutes of talk each)
+  // so nothing gets cut off, then stitched back together in order.
+  async function claudeSort(transcript, onProgress) {
+    const parts = E.chunkText(transcript, 18000);
+    if (parts.length <= 1) return claudeSortPart(transcript);
+    const results = [];
+    for (let i = 0; i < parts.length; i++) {
+      if (onProgress) onProgress(i + 1, parts.length);
+      results.push(await claudeSortPart(parts[i]));
+    }
+    const thoughts = results.flatMap((r) => r.thoughts);
+    const mood = E.moodOf(transcript);
+    return { title: results[0].title, text: transcript, thoughts, mood };
   }
 
   async function claudeText(prompt, onText) {
@@ -438,7 +536,10 @@
     state.claudeBusy.add(note.id);
     renderAll();
     try {
-      const result = await claudeSort(note.transcript);
+      const result = await claudeSort(note.transcript, (i, n) => {
+        state.claudeStatus[note.id] = 'section ' + i + ' of ' + n;
+        renderNotes();
+      });
       const current = state.notes.find((n) => n.id === note.id);
       if (!current) return;
       const doneTexts = new Set(current.thoughts.filter((t) => t.done).map((t) => t.text.toLowerCase()));
@@ -446,12 +547,14 @@
       current.title = result.title;
       current.mood = result.mood;
       current.engine = 'claude';
+      await applyTiming(current);
       await persistNote(current);
       if (!quiet) toast('Claude sorted this note into ' + plural(current.thoughts.length, 'thought') + '.');
     } catch (err) {
       if (!(err && err.code === 'cancelled')) toast(claudeErrorMessage(err));
     } finally {
       state.claudeBusy.delete(note.id);
+      delete state.claudeStatus[note.id];
       renderAll();
     }
   }
@@ -481,6 +584,11 @@
       engine: 'device',
       thoughts: a.thoughts.map((t) => Object.assign({ id: newId(), done: false }, t)),
     };
+    if (opts.timing && opts.timing.words && opts.timing.words.length && !IN_VIEWER) {
+      note.timed = true;
+      await applyTiming(note, opts.timing);
+      TimingStore.put(note.id, opts.timing);
+    }
     if (opts.audio && settings.keepAudio && !IN_VIEWER) {
       try {
         await AudioStore.put(note.id, opts.audio);
@@ -574,12 +682,15 @@
         renderAll();
       },
       expire: () => {
-        if (!state.notes.some((n) => n.id === id)) AudioStore.del(id);
+        if (state.notes.some((n) => n.id === id)) return;
+        AudioStore.del(id);
+        TimingStore.del(id);
+        if (Player.noteId === id) Player.close();
       },
     });
   }
 
-  function resortNote(note, text) {
+  async function resortNote(note, text) {
     const a = sortThoughts(text);
     if (!a.thoughts.length) return toast('There was nothing to sort in that note.');
     const doneTexts = new Set(note.thoughts.filter((t) => t.done).map((t) => t.text.toLowerCase()));
@@ -588,6 +699,7 @@
     note.mood = a.mood;
     note.engine = 'device';
     note.thoughts = a.thoughts.map((t) => Object.assign({ id: newId(), done: doneTexts.has(t.text.toLowerCase()) }, t));
+    await applyTiming(note);
     persistNote(note);
     renderAll();
     toast('Re-sorted into ' + plural(note.thoughts.length, 'thought') + '.');
@@ -793,7 +905,7 @@
     if (current.useLive && !current.liveBlocked && text) {
       await createNote({ text, source: 'voice', duration, audio: blob });
     } else if (blob && blob.size > 2000) {
-      await transcribeBlob(blob, { name: 'Voice note ' + new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }), source: 'voice', duration, keepAudio: true });
+      await transcribeFile(blob, { name: 'Voice note ' + new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }), source: 'voice', duration, keepAudio: true });
     } else if (text) {
       await createNote({ text, source: 'voice', duration, audio: blob });
     } else {
@@ -810,7 +922,7 @@
     $('recMeter').hidden = mode !== 'recording';
     if (mode === 'recording') {
       $('recTitle').textContent = 'Recording… tap to stop and sort';
-      $('recSub').textContent = rec && rec.useLive ? 'Speak naturally. Pauses start new lines.' : "Speak naturally. I'll transcribe on this device when you stop.";
+      $('recSub').textContent = rec && rec.useLive ? 'Speak naturally. Pauses start new lines.' : useDeepgram() ? 'Speak naturally, as long as you like. Deepgram transcribes it when you stop.' : "Speak naturally. I'll transcribe on this device when you stop.";
       $('recTime').textContent = '0:00';
       if (rec && rec.useLive) renderLive();
     } else if (mode === 'starting') {
@@ -819,7 +931,12 @@
       $('recTitle').textContent = 'Finishing up…';
     } else {
       $('recTitle').textContent = 'Tap to record a voice note';
-      $('recSub').textContent = SR && settings.speechMode === 'live' ? 'Talk freely. Your words appear as you speak, then get sorted into thoughts.' : 'Talk freely. When you stop, the audio is transcribed privately on this device and sorted into thoughts.';
+      $('recSub').textContent =
+        SR && settings.speechMode === 'live'
+          ? 'Talk freely. Your words appear as you speak, then get sorted into thoughts.'
+          : useDeepgram()
+            ? 'Talk as long as you like. When you stop, Deepgram turns it into text and it gets sorted into thoughts.'
+            : 'Talk freely. When you stop, the audio is transcribed privately on this device and sorted into thoughts.';
     }
   }
 
@@ -971,9 +1088,133 @@ self.onmessage = async (e) => {
     return { data: new Float32Array(rendered.getChannelData(0)), duration: audio.duration };
   }
 
+  // ---------------------------------------------------------------------
+  // Deepgram: cloud transcription for recordings of any length
+  // ---------------------------------------------------------------------
+  const DEEPGRAM_URL = 'https://api.deepgram.com/v1/listen';
+
+  function probeDuration(blob) {
+    return new Promise((resolve) => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('audio');
+      let timer = null;
+      const done = (v) => {
+        clearTimeout(timer);
+        a.removeAttribute('src');
+        URL.revokeObjectURL(url);
+        resolve(v);
+      };
+      timer = setTimeout(() => done(null), 5000);
+      a.preload = 'metadata';
+      a.onloadedmetadata = () => done(Number.isFinite(a.duration) && a.duration > 0 ? a.duration : null);
+      a.onerror = () => done(null);
+      a.src = url;
+    });
+  }
+
+  // XMLHttpRequest instead of fetch so the upload can report progress.
+  function deepgramRequest(blob, onUpload) {
+    const params = new URLSearchParams({ model: 'nova-3', smart_format: 'true', paragraphs: 'true' });
+    const lang = (settings.lang || '').trim();
+    if (lang) params.set('language', lang);
+    else params.set('detect_language', 'true');
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', DEEPGRAM_URL + '?' + params.toString());
+      xhr.setRequestHeader('Authorization', 'Token ' + settings.dgKey);
+      xhr.setRequestHeader('Content-Type', /^(audio|video)\//.test(blob.type) ? blob.type : 'application/octet-stream');
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) onUpload(e.loaded, e.total, e.loaded >= e.total);
+      };
+      xhr.upload.onload = () => onUpload(blob.size, blob.size, true);
+      xhr.onload = () => {
+        let body = null;
+        try {
+          body = JSON.parse(xhr.responseText);
+        } catch (_) {}
+        if (xhr.status >= 200 && xhr.status < 300 && body) return resolve(body);
+        const msg = (body && (body.err_msg || body.message || body.reason)) || 'Deepgram error ' + xhr.status;
+        reject(Object.assign(new Error(msg), { status: xhr.status }));
+      };
+      xhr.onerror = () => reject(Object.assign(new Error('The upload stopped.'), { network: true }));
+      xhr.send(blob);
+    });
+  }
+
+  function parseDeepgram(res) {
+    const channel = res && res.results && res.results.channels && res.results.channels[0];
+    const alt = channel && channel.alternatives && channel.alternatives[0];
+    if (!alt) throw new Error('Deepgram returned no transcript.');
+    // The paragraph version has line breaks where you paused, which helps splitting.
+    const text = ((alt.paragraphs && alt.paragraphs.transcript) || alt.transcript || '').trim();
+    return { text, timing: E.buildTiming(alt.words), duration: res.metadata && res.metadata.duration };
+  }
+
+  function megabytes(n) {
+    return (n / 1048576).toFixed(n >= 10485760 ? 0 : 1);
+  }
+
+  async function deepgramTranscribe(blob, opts, job) {
+    let duration = opts.duration || null;
+    try {
+      if (!duration) duration = await probeDuration(blob);
+      const length = duration ? clock(duration) + ' of audio' : 'your audio';
+      updateJob(job, { status: 'Uploading ' + length + '…', percent: 0 });
+      let tick = null;
+      const res = await deepgramRequest(blob, (loaded, total, done) => {
+        if (!done) {
+          const pct = Math.round((loaded / total) * 100);
+          updateJob(job, { status: 'Uploading ' + pct + '% · ' + megabytes(loaded) + ' of ' + megabytes(total) + ' MB', percent: pct });
+        } else if (!tick) {
+          const started = Date.now();
+          updateJob(job, { status: 'Deepgram is transcribing ' + length + '…', percent: null });
+          tick = setInterval(() => updateJob(job, { status: 'Deepgram is transcribing ' + length + '… ' + clock((Date.now() - started) / 1000) }), 1000);
+        }
+      }).finally(() => clearInterval(tick));
+      const out = parseDeepgram(res);
+      if (!out.text) {
+        updateJob(job, { status: 'No speech found in this audio.', error: true });
+        return;
+      }
+      updateJob(job, { status: 'Sorting your thoughts…', percent: 100 });
+      await createNote({
+        text: out.text,
+        timing: out.timing,
+        source: opts.source || 'import',
+        duration: out.duration || duration,
+        audio: opts.keepAudio ? blob : null,
+        createdAt: opts.createdAt,
+        fileName: opts.fileName,
+      });
+      endJob(job, 400);
+    } catch (err) {
+      const s = err && err.status;
+      let status = "Deepgram couldn't transcribe this file. " + ((err && err.message) || '');
+      if (s === 401 || s === 403) status = 'Deepgram rejected your API key. Check it in Settings.';
+      else if (s === 402) status = 'Your Deepgram account is out of credit. Add some in the Deepgram console, then try again.';
+      else if (s === 413) status = "This file is over Deepgram's 2 GB limit.";
+      else if (s === 504) status = 'Deepgram took too long on this file. Try again.';
+      else if (s === 429) status = 'Deepgram is busy. Try again in a minute.';
+      else if (err && err.network) status = 'The upload stopped. Check your connection and try again.';
+      const actions = [];
+      if (s === 401 || s === 403) actions.push({ label: 'Open settings', run: openSettings });
+      else actions.push({ label: 'Try again', run: () => transcribeFile(blob, opts, job) });
+      // On-device transcription is only offered for shorter recordings.
+      if (!duration || duration <= 20 * 60) actions.push({ label: 'Transcribe on this device', run: () => whisperTranscribe(blob, opts, job) });
+      updateJob(job, { status, error: true, actions });
+    }
+  }
+
+  /** Transcribe audio with Deepgram when it's set up, otherwise on this device. */
+  function transcribeFile(blob, opts, existingJob) {
+    const job = existingJob || addJob(opts.name || 'Voice note');
+    updateJob(job, { error: false, actions: null, percent: null, status: 'Starting…' });
+    return useDeepgram() ? deepgramTranscribe(blob, opts, job) : whisperTranscribe(blob, opts, job);
+  }
+
   const jobs = [];
   function addJob(name) {
-    const job = { id: newId(), name, status: 'Waiting…', percent: null, error: false };
+    const job = { id: newId(), name, status: 'Waiting…', percent: null, error: false, actions: null };
     jobs.push(job);
     renderJobs();
     return job;
@@ -997,14 +1238,21 @@ self.onmessage = async (e) => {
           'div',
           { class: 'job' + (j.error ? ' error' : '') },
           h('div', { class: 'job-top' }, h('span', { class: 'job-name', text: j.name }), h('span', { class: 'job-status', text: j.status })),
-          j.error ? h('button', { class: 'btn btn-quiet', type: 'button', text: 'Dismiss', onclick: () => endJob(j) }) : h('div', { class: 'bar' + (j.percent == null ? ' indeterminate' : '') }, h('i', { style: j.percent == null ? null : 'width:' + j.percent + '%' }))
+          j.error
+            ? h(
+                'div',
+                { class: 'job-actions' },
+                ...(j.actions || []).map((a) => h('button', { class: 'btn btn-ghost', type: 'button', text: a.label, onclick: a.run })),
+                h('button', { class: 'btn btn-quiet', type: 'button', text: 'Dismiss', onclick: () => endJob(j) })
+              )
+            : h('div', { class: 'bar' + (j.percent == null ? ' indeterminate' : '') }, h('i', { style: j.percent == null ? null : 'width:' + j.percent + '%' }))
         )
       )
     );
   }
 
-  async function transcribeBlob(blob, opts) {
-    const job = addJob(opts.name || 'Voice note');
+  async function whisperTranscribe(blob, opts, job) {
+    updateJob(job, { error: false, actions: null, percent: null });
     try {
       updateJob(job, { status: 'Reading audio…' });
       const { data, duration } = await decodeTo16k(blob);
@@ -1034,7 +1282,8 @@ self.onmessage = async (e) => {
       let status = "Couldn't transcribe this file. " + msg;
       if (/decode|EncodingError|Unable to decode/i.test(msg)) status = "This browser can't read that audio format. Try an .m4a, .mp3 or .wav file.";
       else if (/fetch|network|Failed to load/i.test(msg)) status = "Couldn't download the speech model. Check your connection and try again.";
-      updateJob(job, { status, error: true });
+      else if (/memory|allocation|RangeError/i.test(msg)) status = 'This recording is too long to transcribe on this device. Add a Deepgram key in Settings to transcribe it in the cloud.';
+      updateJob(job, { status, error: true, actions: [{ label: 'Try again', run: () => whisperTranscribe(blob, opts, job) }] });
     }
   }
 
@@ -1063,7 +1312,7 @@ self.onmessage = async (e) => {
       updateJob(job, { status: "Audio files can't be transcribed inside Claude. Copy the transcript from your recorder app and paste it above, or open the standalone app.", error: true });
       return;
     }
-    await transcribeBlob(file, { name: file.name, source: 'import', createdAt: file.lastModified || Date.now(), fileName: file.name, keepAudio: true });
+    await transcribeFile(file, { name: file.name, source: 'import', createdAt: file.lastModified || Date.now(), fileName: file.name, keepAudio: true });
   }
 
   // ---------------------------------------------------------------------
@@ -1155,6 +1404,83 @@ self.onmessage = async (e) => {
     );
   }
 
+  const PLAY_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l10.5-6.5L8 5.5Z" fill="currentColor"/></svg>';
+
+  // One mini player for the whole app, docked at the bottom of the screen.
+  const Player = {
+    noteId: null,
+    url: null,
+    async play(note, start) {
+      const audio = $('playerAudio');
+      if (this.noteId !== note.id) {
+        const blob = await AudioStore.get(note.id).catch(() => null);
+        if (!blob) return toast('The audio for this note is stored on another device.');
+        if (this.url) URL.revokeObjectURL(this.url);
+        this.url = URL.createObjectURL(blob);
+        this.noteId = note.id;
+        audio.src = this.url;
+      }
+      $('playerTitle').textContent = note.title || 'Voice note';
+      $('player').hidden = false;
+      document.body.classList.add('has-player');
+      const target = Math.max(0, (start || 0) - 1);
+      const seek = () => {
+        // Recordings made in the browser often report no duration until
+        // the end is found, which makes seeking unreliable. Find it first.
+        if (!Number.isFinite(audio.duration) && target > 0) {
+          audio.addEventListener('durationchange', () => {
+            audio.currentTime = target;
+            audio.play().catch(() => {});
+          }, { once: true });
+          audio.currentTime = 1e9;
+          return;
+        }
+        audio.currentTime = target;
+        audio.play().catch(() => {});
+      };
+      if (audio.readyState >= 1) seek();
+      else audio.addEventListener('loadedmetadata', seek, { once: true });
+    },
+    close() {
+      const audio = $('playerAudio');
+      audio.pause();
+      $('player').hidden = true;
+      document.body.classList.remove('has-player');
+    },
+    bind() {
+      const audio = $('playerAudio');
+      const paint = () => {
+        const d = audio.duration;
+        $('playerTime').textContent = clock(audio.currentTime) + (Number.isFinite(d) ? ' / ' + clock(d) : '');
+      };
+      const paintButton = () => {
+        $('player').classList.toggle('playing', !audio.paused);
+        $('playerToggle').setAttribute('aria-label', audio.paused ? 'Play' : 'Pause');
+      };
+      audio.addEventListener('timeupdate', paint);
+      audio.addEventListener('durationchange', paint);
+      audio.addEventListener('play', paintButton);
+      audio.addEventListener('pause', paintButton);
+      audio.addEventListener('ended', paintButton);
+      $('playerToggle').addEventListener('click', () => (audio.paused ? audio.play().catch(() => {}) : audio.pause()));
+      $('playerBack').addEventListener('click', () => (audio.currentTime = Math.max(0, audio.currentTime - 15)));
+      $('playerFwd').addEventListener('click', () => (audio.currentTime = Math.min(audio.duration || Infinity, audio.currentTime + 15)));
+      $('playerClose').addEventListener('click', () => this.close());
+    },
+  };
+
+  /** "▶ 12:34" button that plays the recording from when a thought was said. */
+  function timeChip(t, n) {
+    if (t.start == null) return null;
+    if (n.audio && !IN_VIEWER) {
+      const btn = h('button', { class: 'play-at', type: 'button', 'aria-label': 'Play from ' + clock(t.start), onclick: () => Player.play(n, t.start) });
+      btn.innerHTML = PLAY_ICON;
+      btn.append(clock(t.start));
+      return btn;
+    }
+    return h('span', { class: 'meta-time', text: 'at ' + clock(t.start) });
+  }
+
   function thoughtCard(item) {
     const { t, n } = item;
     const isTodo = t.kind === 'todo';
@@ -1180,6 +1506,7 @@ self.onmessage = async (e) => {
       { class: 'thought-meta' },
       h('span', { class: 'meta-kind', text: KIND[t.kind].one }),
       h('span', { class: 'meta-time', text: when(n.createdAt) }),
+      timeChip(t, n),
       t.due ? h('span', { class: 'tag tag-due', text: t.due.label }) : null,
       ...(t.topics || []).map((tp) => (TOPIC[tp] ? h('span', { class: 'tag', text: TOPIC[tp].label }) : null)),
       n.example ? h('span', { class: 'tag tag-example', text: 'Example' }) : null
@@ -1256,7 +1583,7 @@ self.onmessage = async (e) => {
             h('span', { text: plural(n.thoughts.length, 'thought') }),
             n.duration ? h('span', { text: SOURCE_LABEL[n.source] + ' · ' + clock(n.duration) }) : h('span', { text: SOURCE_LABEL[n.source] || 'Note' }),
             n.mood ? h('span', { class: 'mood', text: n.mood.label }) : null,
-            busy ? h('span', { text: 'Claude is sorting…' }) : n.engine === 'claude' ? h('span', { text: 'Sorted by Claude' }) : null,
+            busy ? h('span', { text: 'Claude is sorting' + (state.claudeStatus[n.id] ? ' ' + state.claudeStatus[n.id] : '') + '…' }) : n.engine === 'claude' ? h('span', { text: 'Sorted by Claude' }) : null,
             n.example ? h('span', { class: 'tag tag-example', text: 'Example' }) : null
           )
         );
@@ -1273,23 +1600,33 @@ self.onmessage = async (e) => {
   function noteBody(n) {
     const body = h('div', { class: 'note-body' });
     if (n.audio && !IN_VIEWER) {
-      const audio = h('audio', { controls: true, preload: 'metadata' });
-      AudioStore.get(n.id)
-        .then((blob) => {
-          if (blob) audio.src = URL.createObjectURL(blob);
-          else audio.replaceWith(h('p', { class: 'muted small', text: 'The audio for this note is stored on another device.' }));
-        })
-        .catch(() => audio.remove());
-      body.append(audio);
+      const play = h('button', { class: 'btn btn-ghost play-note', type: 'button', onclick: () => Player.play(n, 0) });
+      play.innerHTML = PLAY_ICON;
+      play.append('Play recording' + (n.duration ? ' · ' + clock(n.duration) : ''));
+      body.append(play);
     }
     const ta = h('textarea', { 'aria-label': 'Transcript', rows: 5, readonly: n.example });
     ta.value = n.transcript || '';
     const save = h('button', { class: 'btn btn-primary', type: 'button', hidden: true, onclick: () => resortNote(n, ta.value) }, 'Save and re-sort');
     ta.addEventListener('input', () => (save.hidden = ta.value.trim() === (n.transcript || '').trim()));
     body.append(h('label', { class: 'small muted', text: 'Transcript' }), ta);
-    const list = h('ul');
-    for (const t of n.thoughts) list.append(h('li', { 'data-kind': t.kind }, h('span', { class: 'dot', 'aria-hidden': 'true' }), h('span', null, h('strong', { text: KIND[t.kind].one + ': ' }), t.text)));
-    body.append(h('div', { class: 'note-thoughts' }, list));
+    // Long recordings are split into 15-minute sections so they're easy to scan.
+    const SECTION = 15 * 60;
+    const timed = n.duration > 20 * 60 && n.thoughts.some((t) => t.start != null);
+    const thoughtsBox = h('div', { class: 'note-thoughts' });
+    let list = null;
+    let section = -1;
+    for (const t of n.thoughts) {
+      const s = timed && t.start != null ? Math.floor(t.start / SECTION) : section;
+      if (!list || (timed && s !== section)) {
+        section = s;
+        if (timed && s >= 0) thoughtsBox.append(h('h4', { class: 'note-section', text: clock(s * SECTION) + ' – ' + clock(Math.min(n.duration, (s + 1) * SECTION)) }));
+        list = h('ul');
+        thoughtsBox.append(list);
+      }
+      list.append(h('li', { 'data-kind': t.kind }, h('span', { class: 'dot', 'aria-hidden': 'true' }), h('span', null, h('strong', { text: KIND[t.kind].one + ': ' }), t.text, ' ', timeChip(t, n))));
+    }
+    body.append(thoughtsBox);
     if (!n.example) {
       const busy = state.claudeBusy.has(n.id);
       body.append(
@@ -1461,8 +1798,11 @@ self.onmessage = async (e) => {
     $('tidy').checked = settings.tidy;
     $('speechMode').value = settings.speechMode;
     $('speechMode').querySelector('[value="live"]').disabled = !SR;
-    if (!SR) $('speechMode').value = 'whisper';
+    if (!SR) $('speechMode').value = 'after';
+    $('transcriber').value = settings.transcriber;
+    $('dgKey').value = settings.dgKey;
     $('whisperModel').value = settings.whisperModel;
+    syncSpeechFields();
     $('lang').value = settings.lang;
     $('lang').placeholder = navigator.language || 'en-US';
     $('keepAudio').checked = settings.keepAudio;
@@ -1472,15 +1812,25 @@ self.onmessage = async (e) => {
         : 'Notes are saved in this browser on this device' + (IN_VIEWER ? '' : ', and audio never leaves it') + '. Export a backup to move them.';
   }
 
+  function syncSpeechFields() {
+    const deepgram = $('transcriber').value === 'deepgram';
+    $('dgKeyField').hidden = !deepgram;
+    $('whisperField').hidden = deepgram && !!$('dgKey').value.trim();
+    $('dgStatus').textContent = deepgram ? ($('dgKey').value.trim() ? 'Deepgram is set up. Imports and after-you-stop recordings use it.' : 'Add your key to start using Deepgram. Until then, audio is transcribed on this device.') : '';
+  }
+
+  function openSettings() {
+    const dlg = $('settings');
+    fillSettings();
+    if (dlg.open) return;
+    if (dlg.showModal) dlg.showModal();
+    else dlg.setAttribute('open', '');
+  }
+
   function bindSettings() {
     const dlg = $('settings');
-    const open = () => {
-      fillSettings();
-      if (dlg.showModal) dlg.showModal();
-      else dlg.setAttribute('open', '');
-    };
-    $('settingsBtn').addEventListener('click', open);
-    $('enginePill').addEventListener('click', open);
+    $('settingsBtn').addEventListener('click', openSettings);
+    $('enginePill').addEventListener('click', openSettings);
     dlg.addEventListener('click', (e) => {
       if (e.target === dlg) dlg.close();
     });
@@ -1489,6 +1839,7 @@ self.onmessage = async (e) => {
         settings[key] = prop === 'checked' ? $(id).checked : $(id).value.trim();
         saveSettings();
         updateEngineUI();
+        syncSpeechFields();
         if (!rec) setRecordingUI('idle');
         renderAll();
       });
@@ -1498,6 +1849,9 @@ self.onmessage = async (e) => {
     bind('claudeModel', 'claudeModel', 'value');
     bind('tidy', 'tidy', 'checked');
     bind('speechMode', 'speechMode', 'value');
+    bind('transcriber', 'transcriber', 'value');
+    bind('dgKey', 'dgKey', 'value');
+    $('dgKey').addEventListener('input', syncSpeechFields);
     bind('whisperModel', 'whisperModel', 'value');
     bind('lang', 'lang', 'value');
     bind('keepAudio', 'keepAudio', 'checked');
@@ -1539,6 +1893,8 @@ self.onmessage = async (e) => {
       renderAll();
       await backend.clear().catch(() => {});
       AudioStore.clear();
+      TimingStore.clear();
+      Player.close();
       dlg.close();
       toast('All notes deleted.');
     });
@@ -1697,6 +2053,7 @@ self.onmessage = async (e) => {
     bindCapture();
     bindBoard();
     bindSettings();
+    Player.bind();
     setRecordingUI('idle');
     updateEngineUI();
 

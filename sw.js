@@ -1,6 +1,6 @@
 // Offline support: keeps the app shell cached so it opens without a connection.
 // Speech models are cached separately by the transcription library.
-const CACHE = 'thought-sorter-v1';
+const CACHE = 'thought-sorter-v2';
 const SHELL = ['./', 'index.html', 'src/styles.css', 'src/engine.js', 'src/app.js', 'manifest.webmanifest', 'icon.svg'];
 
 self.addEventListener('install', (event) => {

@@ -103,3 +103,40 @@ test('summarize counts recent thoughts and open to-dos', () => {
   assert.equal(s.openTodos.length, 1);
   assert.deepEqual(s.topics[0], { id: 'work', count: 2, label: 'Work' });
 });
+
+test('chunkText splits long transcripts on paragraph and sentence breaks', () => {
+  const para = (n) => Array.from({ length: n }, (_, i) => `Sentence number ${i} is here.`).join(' ');
+  const text = [para(40), para(40), para(40)].join('\n\n');
+  const chunks = E.chunkText(text, 2000);
+  assert.ok(chunks.length > 1);
+  assert.ok(chunks.every((c) => c.length <= 2000));
+  assert.equal(chunks.join(' ').replace(/\s+/g, ' '), text.replace(/\s+/g, ' '));
+  assert.ok(chunks.every((c) => /\.$/.test(c)), 'every chunk ends on a sentence');
+  // Unpunctuated speech still gets cut on spaces.
+  const run = Array.from({ length: 900 }, (_, i) => 'word' + i).join(' ');
+  const hard = E.chunkText(run, 1000);
+  assert.ok(hard.every((c) => c.length <= 1000 && !/^\s|\s$/.test(c)));
+  assert.deepEqual(E.chunkText('short note', 1000), ['short note']);
+});
+
+test('normWords drops punctuation and filler', () => {
+  assert.deepEqual(E.normWords("Um, I'm going to the store. Uh, okay!"), ['im', 'going', 'to', 'the', 'store', 'okay']);
+});
+
+test('alignThoughts finds when each thought was said, even after small rewrites', () => {
+  const said = 'um so I need to call the dentist tomorrow and uh what if we turned the garage into a studio I am worried about Friday';
+  const words = said.split(' ').map((w, i) => ({ word: w, start: i * 0.5 }));
+  const timing = E.buildTiming(words);
+  const thoughts = [
+    { text: 'I need to call the dentist tomorrow.' },
+    { text: 'What if we turned the garage into a studio?' },
+    { text: "I'm worried about Friday." }, // rewritten contraction
+    { text: 'Something never said.' },
+  ];
+  const starts = E.alignThoughts(thoughts, timing);
+  assert.equal(starts[0], 1); // "I" is the 3rd spoken word
+  assert.equal(starts[1], 5.5); // "what" is the 12th
+  assert.equal(starts[2], 11); // "I'm" isn't in the audio, so it anchors on "worried" (23rd)
+  assert.equal(starts[3], 11); // unmatched thoughts inherit the previous time
+  assert.deepEqual(E.alignThoughts([{ text: 'x' }], { words: [], starts: [] }), [null]);
+});

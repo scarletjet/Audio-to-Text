@@ -23,17 +23,27 @@ One rambling 90-second voice memo like *"I need to call the dentist tomorrow… 
 
 ## Ways to capture
 
-- **Record**: tap the red button and talk. You see a live transcript as you speak, using your browser's speech recognition. Each pause starts a new line.
-- **Private recording**: set *Speech to text → Private transcript after you stop* in Settings. The audio is transcribed on your device with [Whisper](https://github.com/openai/whisper) via [Transformers.js](https://github.com/huggingface/transformers.js). Nothing leaves the device.
-- **Import voice memos**: pick or drop `.m4a`, `.mp3`, `.wav`, `.ogg`, `.webm` and similar files (you can select several at once). They're transcribed on-device with Whisper and dated by when the file was recorded.
+- **Record**: tap the red button and talk. Pick how it's transcribed in Settings:
+  - *Show my words as I talk* uses your browser's speech recognition for a live transcript. Each pause starts a new line.
+  - *Transcribe when I stop* sends the recording to Deepgram (or Whisper on your device) after you finish. Use this for long recordings.
+- **Import voice memos**: pick or drop `.m4a`, `.mp3`, `.wav`, `.ogg`, `.webm` and similar files (you can select several at once). They're dated by when the file was recorded.
 - **Type, paste or dictate**: use your keyboard's microphone, or paste a transcript from your phone's recorder app. `.txt`, `.vtt` and `.srt` transcripts can be imported too.
 - **Share to the app**: install it to your home screen, then on Android share text from another app straight into Thought Sorter.
+
+## Transcription
+
+- **Deepgram (recommended for long audio)**: add your Deepgram API key under *Settings → Speech to text*. Files up to 2 GB go straight from your device to Deepgram's Nova-3 model, so hours of audio take about a minute and your phone does none of the heavy work. You see upload progress, and you get punctuation, paragraph breaks and automatic language detection (or set a language). Create a key in the [Deepgram console](https://console.deepgram.com) under API Keys.
+- **Whisper on your device**: used when no Deepgram key is set. Private and offline after a one-time model download, best for clips under about 20 minutes.
+
+### Tap a thought to hear it
+
+Deepgram returns the time of every word, so each thought gets a time stamp like `▶ 12:34`. Tap it and the mini player at the bottom of the screen plays your recording from that moment. Recordings over 20 minutes are also split into 15-minute sections in the Notes view. Audio and timings stay on the device that transcribed them.
 
 ## Sorting
 
 - **On-device (default)**: a fast rule-based engine (`src/engine.js`) that handles punctuated text and the unpunctuated run-on text browser dictation produces. It needs no network.
 - **It learns from you**: tap **Move** on any thought to re-file it. The words in that thought then lean toward the category you picked, so similar thoughts land there next time.
-- **Claude (optional)**: for more nuanced splitting and labeling, turn on *Sort with Claude* in Settings and add an Anthropic API key. Your corrections are passed along so Claude follows your preferences. The on-device sort shows instantly, then Claude's version replaces it a moment later.
+- **Claude (optional)**: for more nuanced splitting and labeling, turn on *Sort with Claude* in Settings and add an Anthropic API key. Your corrections are passed along so Claude follows your preferences. The on-device sort shows instantly, then Claude's version replaces it a moment later. Long transcripts are sorted in sections of about 20 minutes each, so nothing is cut off.
 
 ## Patterns
 
@@ -41,9 +51,10 @@ The **Patterns** tab shows what you think about most over 7 days, 30 days or all
 
 ## Privacy
 
-- Notes, settings and your API key are stored in your browser (`localStorage`). Audio is stored on your device in IndexedDB.
-- On-device Whisper downloads its model once (about 40 MB for the fast English model) and caches it.
-- Live transcripts use your browser's built-in speech service. Some browsers send audio to their provider for this. Pick the private Whisper mode in Settings if you want everything to stay on the device.
+- Notes and timings are stored on your device in IndexedDB, which has room for many hours of transcripts. Audio is stored on your device too. Settings and API keys stay in this browser's local storage.
+- With Deepgram set up, audio you transcribe goes directly from your browser to Deepgram using your key.
+- On-device Whisper downloads its model once (about 40 MB for the fast English model) and caches it. Nothing leaves the device.
+- Live transcripts use your browser's built-in speech service. Some browsers send audio to their provider for this.
 - With Claude turned on, note text goes directly from your browser to the Anthropic API using your key.
 - **Export backup** and **Restore backup** in Settings move your notes between devices. **Export Markdown** gives you a readable copy grouped by kind.
 
